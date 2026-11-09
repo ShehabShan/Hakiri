@@ -1,0 +1,56 @@
+{
+  "sourceId": "openfilms",
+  "attribution": "Films © Blender Foundation, CC BY 3.0 — durian.blender.org / bigbuckbunny.org. Streams via archive.org and mux.dev test streams.",
+  "items": [
+    {
+      "id": "sintel",
+      "title": "Sintel",
+      "altTitles": ["Durian Open Movie"],
+      "synopsis": "A lonely young woman, Sintel, helps and befriends a dragon she calls Scales. When he is kidnapped she sets out on an epic quest to find her lost companion. (Blender Foundation open movie, CC BY 3.0.)",
+      "genres": ["Fantasy", "Adventure", "Short"],
+      "year": 2010,
+      "status": "FINISHED",
+      "posterUrl": null,
+      "episodes": [
+        {
+          "number": 1,
+          "title": "Sintel — Part 1: Scales & The Quest (Stereo)",
+          "durationSeconds": 888,
+          "streams": [
+            { "url": "https://archive.org/download/Sintel/sintel-2048-stereo_512kb.mp4", "kind": "MP4", "qualityLabel": "480p" },
+            { "url": "https://archive.org/download/Sintel/sintel-2048-surround_512kb.mp4", "kind": "MP4", "qualityLabel": "480p (surround)" }
+          ]
+        },
+        {
+          "number": 2,
+          "title": "Sintel — Part 2: The Dragon's Lair (Surround / Stereo)",
+          "durationSeconds": 888,
+          "streams": [
+            { "url": "https://archive.org/download/Sintel/sintel-2048-surround_512kb.mp4", "kind": "MP4", "qualityLabel": "480p (surround)" },
+            { "url": "https://archive.org/download/Sintel/sintel-2048-stereo_512kb.mp4", "kind": "MP4", "qualityLabel": "480p" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bigbuckbunny",
+      "title": "Big Buck Bunny",
+      "altTitles": ["Peach Open Movie", "BBB"],
+      "synopsis": "A giant rabbit takes gentle revenge on three bullying rodents. (Blender Foundation open movie, CC BY 3.0; HLS test stream courtesy of Mux.)",
+      "genres": ["Comedy", "Short"],
+      "year": 2008,
+      "status": "FINISHED",
+      "posterUrl": null,
+      "episodes": [
+        {
+          "number": 1,
+          "title": "Big Buck Bunny (HLS)",
+          "durationSeconds": 596,
+          "streams": [
+            { "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8", "kind": "HLS", "qualityLabel": "auto" }
+          ]
+        }
+      ]
+    }
+  ]
+}

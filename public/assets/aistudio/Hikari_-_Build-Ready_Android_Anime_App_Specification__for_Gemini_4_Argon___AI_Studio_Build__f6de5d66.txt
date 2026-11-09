@@ -1,0 +1,566 @@
+# Hikari — Build-Ready Specification for an Unofficial Anime App
+### Target builder: Gemini 4 Argon ("Argon 4") in Google AI Studio Build mode (Android) · Spec date: 2026-11-09
+
+---
+
+## Executive summary
+
+**Hikari** is a client-only, single-module Android app (Kotlin + Jetpack Compose + Material 3) for browsing anime, viewing details and episode lists, streaming episodes, and tracking favorites and watch history. Content is supplied through a **swappable source/provider layer** (`AnimeSource` SPI): the app hosts nothing, depends on no single site, and treats every source as unreliable by design. Metadata (posters, synopses, scores) comes from the **Jikan v4 API** (free, unofficial MyAnimeList API, no key required). v1 ships with one **bundled, legally safe demo source** ("Open Films") backed by Creative-Commons-licensed open movies with verified working stream URLs, so the entire app — including the player — is buildable and testable end-to-end without scraping anyone. The SPI is designed so third-party anime-site providers (animepahe-style sites) can be added later as config + one class each; this document is direct about the legal risk of doing so (§10) and deliberately does not include working extraction code for named pirate sites.
+
+The document makes every technical decision (stack, architecture, package layout, data models, design system, screens, states, milestones) so that Argon 4 can build the app in **8 sequential milestones**, each with a ready-to-paste prompt, acceptance criteria, and a test checklist. §11 contains paste-ready System Instructions for Argon 4; §12 lists verified reusable skills/instruction packs with exact fallback text for environments that don't support them.
+
+**"Small library" interpretation:** a deliberately small catalog (≈ 20–50 titles from the bundled source + curated Jikan top/seasonal lists), few sources (1 bundled + the SPI for more), and a lean feature set (no accounts, no downloads, no tracking-site sync) — with every seam (SPI, repository, DB schema, navigation) designed to grow. If you instead meant "small Android library module": not applicable — AI Studio only supports single-module apps.
+
+---
+
+## Table of contents
+
+1. [Platform constraints — verified](#1-platform-constraints--verified)
+2. [Decisions & assumptions](#2-decisions--assumptions)
+3. [Vision, target user, v1 scope, non-goals](#3-vision-target-user-v1-scope-non-goals)
+4. [Tech stack, architecture, package structure, data models](#4-tech-stack-architecture-package-structure-data-models)
+5. [Content source layer](#5-content-source-layer)
+6. [UI/UX: design system, screens, navigation, motion, accessibility](#6-uiux)
+7. [v1 feature specifications](#7-v1-feature-specifications)
+8. [Quality plan & definition of done](#8-quality-plan--definition-of-done)
+9. [Performance, security, privacy](#9-performance-security-privacy)
+10. [Risks — copyright, policies, mitigations](#10-risks)
+11. [System Instructions for Argon 4 (paste-ready)](#11-system-instructions-for-argon-4)
+12. [Skills & reusable instruction packs (verified)](#12-skills--reusable-instruction-packs)
+13. [Phased build plan: milestones M0–M7 with prompts](#13-phased-build-plan)
+14. [Appendix A: demo catalog seed data](#appendix-a-demo-catalog-seed-data)
+15. [Appendix B: project doc files to keep in the repo](#appendix-b-project-doc-files)
+
+---
+
+## 1. Platform constraints — verified
+
+Checked against the official docs on 2026-11-09 (`aistudio.google.com/docs/aistudio-android`, `aistudio.google.com/docs/aistudio-build-mode`). Your stated limits are **accurate**, with a few nuances worth knowing:
+
+| Your statement | Verdict | Nuance |
+|---|---|---|
+| Build mode generates native Kotlin + Jetpack Compose (Material 3) | ✅ Confirmed | Gradle Kotlin DSL project; agent manages dependencies from Maven/Google repos. |
+| Client-side only; no server component, no secrets manager | ✅ Confirmed for Android | Secrets management/multiplayer/Workspace APIs are **web-app-only** features. Android apps *can* optionally use a managed **Firebase** integration (AI Logic + App Check, Firestore, Auth) — this spec doesn't use it (see §2, D11). |
+| Single-activity, single-module only; no Java/XML layouts; no NDK/C++; phone & tablet only | ✅ Confirmed | Only XML **layouts** are excluded. `AndroidManifest.xml` and XML **resources** (strings, drawables) are normal and generated. No Wear OS / Android TV. |
+| Preview runs in a cloud emulator without Google Play services | ✅ Confirmed | Also no camera, NFC, Bluetooth; GPS simulated. Install-on-device via WebUSB (Chrome/Edge) works for real-device testing. |
+| Export is ZIP only; Play publishing is internal-testing only | ✅ Confirmed | GitHub export is **not available for Android** projects (web apps have it). Play internal testing track, up to 100 testers; production releases must be managed in Play Console directly. |
+
+**Unverified items (flagged, not assumed):**
+- Whether Build mode's coding agent can be pinned specifically to `gemini-4-argon`. The model exists (flagship reasoning model, 1M context), and Build mode is driven by the "Antigravity Agent"; the docs don't document a per-project model picker for Build mode. This spec works regardless of which Gemini model executes it.
+- Whether Build mode exposes a dedicated "System Instructions" settings field for Android projects. Not documented. §11 gives you the instructions text plus a fallback strategy (first-message preamble + in-repo doc files) that works either way.
+- Whether Build mode reads `SKILL.md` / `AGENTS.md` files from the project. Not documented for Build mode (it *is* documented for Antigravity App/CLI/IDE and Android Studio). §12 provides paste fallbacks for every pack.
+
+**Design consequences baked into this spec:** no backend, no API keys or secrets anywhere (only keyless public endpoints), all state local (Room + DataStore), one `MainActivity`, one Gradle module, Compose-only UI, no Play-services dependencies, and everything previewable in the cloud emulator (network access from the emulator is assumed to work since the agent itself fetches dependencies; if a corporate network blocks a stream host, use the device install path to verify the player).
+
+---
+
+## 2. Decisions & assumptions
+
+Every decision Argon 4 must not re-litigate. Rationale kept short.
+
+| # | Decision | Choice | Why |
+|---|---|---|---|
+| D1 | Language/UI | Kotlin, Jetpack Compose, Material 3 | Mandated by platform. |
+| D2 | Architecture | MVVM + unidirectional data flow, 3 layers (ui / domain / data) in one module, package-by-layer-then-feature | Google's recommended architecture; the most-represented pattern in LLM training data → fewest generation errors. Single module mandated. |
+| D3 | DI | **Manual DI** via `AppContainer` (created in `Application`), constructor injection everywhere | Hilt adds KSP/plugin config that AI builders frequently misconfigure; at ~30 classes manual DI is deterministic, debuggable, and testable. Swap-in path for Hilt stays open because everything is constructor-injected. |
+| D4 | Navigation | **Navigation Compose** (`androidx.navigation:navigation-compose`), type-safe routes via sealed `Screen` definitions | Mature, massively documented. Navigation 3 is too new → higher hallucination risk for an AI builder. |
+| D5 | Networking | OkHttp + Retrofit + `kotlinx.serialization` | Best-known stack to LLMs; kotlinx-serialization avoids kapt. OkHttp cache doubles as HTTP-level cache for sources. |
+| D6 | Images | Coil 3 (`io.coil-kt.coil3:coil-compose` + `coil-network-okhttp`) | Compose-first, Kotlin-first, shares the OkHttp client. |
+| D7 | Video | Media3 ExoPlayer + `media3-exoplayer-hls` + `media3-ui-compose-material3` | Official player; HLS + progressive MP4 cover the demo source and typical streaming sites; Compose UI module avoids `AndroidView` interop. |
+| D8 | Persistence | Room (catalog cache, favorites, watch history, episode progress) + DataStore Preferences (settings) | Standard; survives process death; enables offline browse of cached data. |
+| D9 | Async | Kotlin Coroutines + Flow only (no RxJava) | Standard. |
+| D10 | Metadata API | **Jikan v4** (`api.jikan.moe/v4`) — no key, free | Public anime metadata (posters, synopses, scores, seasonal lists). Rate limits: 3 req/s, 60 req/min → client-side throttle + aggressive caching required (§5.4). **AniList rejected**: its Terms of Use prohibit use in competing anime list/tracker services — an anime app with favorites/history sails too close. Kitsu rejected: weaker docs, less LLM familiarity. |
+| D11 | Firebase | **Not used in v1** | No AI features needed; keeps the app fully local/private, zero cloud coupling, zero quota dependencies. Can be added later for sync. |
+| D12 | Content strategy | 1 bundled legal demo source ("Open Films") + full `AnimeSource` SPI for future providers; third-party anime-site providers are **not shipped** in v1 | Makes the app 100% buildable/testable and demo-able without legal exposure; the SPI satisfies the "several sites, no single dependency" requirement architecturally. Direct risk discussion in §10. |
+| D13 | Min/target SDK | minSdk 26, targetSdk = whatever the AI Studio template defaults to (do not fight the template) | 26 covers ~98% of devices; avoids legacy-compat branches. |
+| D14 | Orientation/form factor | Phones portrait-first; player supports landscape + fullscreen; tablet gets adaptive grid columns (no separate tablet layouts in v1) | Lean v1; adaptive column counts are cheap. |
+| D15 | Theming | Dark-first custom palette + light theme; **no dynamic color** in v1 | Dynamic color varies per device/emulator → unpredictable screenshots and brand. Static brand palette (§6.1). |
+| D16 | Testing | JUnit4 unit tests for domain/data; a small set of Compose UI tests; manual test checklists per milestone | Cloud environment favors fast local tests; see §8. |
+| D17 | App identity | Name "Hikari" (placeholder — rename freely), package `app.hikari.android` | Neutral name; must not contain "animepahe"/site names/trademarks. |
+
+**Assumptions** (made once, written down): the user has no existing codebase (fresh Build-mode project); English-only UI strings in v1 (all in `strings.xml`, so localization is additive); no analytics/crash reporting in v1 (privacy §9.3); episode streams in v1 are direct HTTPS MP4/HLS URLs supplied by a source (no DRM, no torrent, no WebView extraction in v1 — the SPI has an explicit extension point for extractor-based providers later).
+
+---
+
+## 3. Vision, target user, v1 scope, non-goals
+
+**Vision.** A polished, fast, private anime companion: find something to watch, watch it, and pick up where you left off — with zero accounts, zero cloud, and sources that can be swapped like cartridges.
+
+**Target user.** An anime fan with an Android phone who currently juggles ad-ridden websites; values a clean native UI, continue-watching, and a personal library; technically tolerant (sideloads APKs, understands "unofficial").
+
+**v1 scope (buildable entirely inside AI Studio):**
+1. Browse: home screen with curated rows (Continue Watching, Trending via Jikan, This Season via Jikan, bundled source catalog).
+2. Search: by title across Jikan (metadata) and enabled sources (playable).
+3. Details: poster, synopsis, metadata, score, genres; episode list with watched indicators.
+4. Player: Media3 ExoPlayer; MP4 + HLS; fullscreen, seek, resume-from-position, auto-mark-watched at 90%.
+5. Favorites: toggle anywhere a title appears; Library tab lists them.
+6. Watch history & Continue Watching: per-episode progress; "resume" surface on Home and Library.
+7. Settings: theme (system/light/dark), enabled sources list, playback preferences (autoplay next, resume behavior), clear history/cache, About + legal notice.
+
+**Explicit non-goals for v1:** user accounts and cloud sync; downloads/offline video; MAL/AniList account sync; notifications; comments/social; Chromecast; DRM content; multi-profile; in-app source marketplace; manga; tablet-specific two-pane layouts; monetization of any kind (see §10 — monetizing unlicensed content multiplies legal risk).
+
+---
+
+## 4. Tech stack, architecture, package structure, data models
+
+### 4.1 Dependencies (versions = latest stable at generation time; the agent resolves exact numbers)
+
+- `androidx.navigation:navigation-compose`
+- `androidx.room:room-runtime`, `room-ktx`, compiler via **KSP**
+- `androidx.datastore:datastore-preferences`
+- `com.squareup.retrofit2:retrofit` + `retrofit2-kotlinx-serialization-converter`, `com.squareup.okhttp3:okhttp` + `logging-interceptor`
+- `org.jetbrains.kotlinx:kotlinx-serialization-json`
+- `io.coil-kt.coil3:coil-compose`, `io.coil-kt.coil3:coil-network-okhttp` (Coil 3.x)
+- `androidx.media3:media3-exoplayer`, `media3-exoplayer-hls`, `media3-ui-compose-material3` (1.11.x)
+- `androidx.lifecycle:lifecycle-viewmodel-compose`, `lifecycle-runtime-compose`
+- Tests: JUnit4, `kotlinx-coroutines-test`, `androidx.compose.ui:ui-test-junit4`, Turbine (optional)
+
+### 4.2 Layering (strict dependency rule: ui → domain ← data)
+
+- **ui/** — Compose screens, ViewModels, navigation. ViewModels expose a single immutable `UiState` data class via `StateFlow`; events flow up as function calls. No repository types leak into composables.
+- **domain/** — plain Kotlin: models, repository *interfaces*, use cases only where logic is non-trivial (e.g. `BuildHomeFeedUseCase`, `ResolvePlayableStreamUseCase`). No Android imports.
+- **data/** — repository implementations, Room, DataStore, Retrofit/Jikan, the source SPI + bundled source, mappers. Every external DTO is mapped to a domain model at this boundary; DTOs never cross into domain/ui.
+
+### 4.3 Package structure (single module `app`)
+
+```text
+app.hikari.android
+├── HikariApp.kt            // Application; builds AppContainer
+├── MainActivity.kt          // single activity; sets content, theme, NavHost
+├── di/AppContainer.kt       // manual DI: wires everything, exposed via HikariApp
+├── ui/
+│   ├── theme/               // Color.kt, Type.kt, Shape.kt, Dimens.kt, Theme.kt, Motion.kt
+│   ├── components/          // PosterCard, MediaRow, EpisodeRow, ErrorState, EmptyState,
+│   │                        // LoadingState, FavoriteButton, SectionHeader, HikariTopBar…
+│   ├── navigation/          // Screen.kt (sealed routes), HikariNavHost.kt, BottomBar.kt
+│   ├── home/                // HomeScreen.kt, HomeViewModel.kt, HomeUiState.kt
+│   ├── search/              // SearchScreen, SearchViewModel, SearchUiState
+│   ├── details/             // DetailsScreen, DetailsViewModel, DetailsUiState
+│   ├── player/              // PlayerScreen, PlayerViewModel, PlayerUiState
+│   ├── library/             // LibraryScreen (Favorites + History tabs), LibraryViewModel
+│   └── settings/            // SettingsScreen, SettingsViewModel
+├── domain/
+│   ├── model/               // Anime, Episode, StreamLink, MediaId, SourceInfo,
+│   │                        // WatchProgress, HomeFeed, AppError
+│   ├── repository/          // CatalogRepository, MetadataRepository, LibraryRepository,
+│   │                        // SettingsRepository (interfaces)
+│   └── usecase/             // BuildHomeFeedUseCase, ResolvePlayableStreamUseCase,
+│                            // ToggleFavoriteUseCase, RecordWatchProgressUseCase
+└── data/
+    ├── source/              // AnimeSource.kt (SPI), SourceRegistry.kt, SourceHealth.kt
+    │   └── openfilms/       // OpenFilmsSource.kt + open_films_catalog.json (assets)
+    ├── jikan/               // JikanApi.kt (Retrofit), JikanDtos.kt, JikanRateLimiter.kt
+    ├── local/               // HikariDatabase, DAOs, entities, Converters
+    ├── repositoryimpl/      // CatalogRepositoryImpl, MetadataRepositoryImpl,
+    │                        // LibraryRepositoryImpl, SettingsRepositoryImpl
+    └── mapper/              // DTO/entity ↔ domain mappers
+```
+
+### 4.4 Core data models (domain layer — exact shapes, Argon 4 must not improvise)
+
+```kotlin
+// Identity: every title is keyed by (sourceId, sourceMediaId); malId links metadata.
+data class MediaId(val sourceId: String, val value: String)
+
+data class Anime(
+    val id: MediaId,
+    val title: String,
+    val altTitles: List<String> = emptyList(),
+    val posterUrl: String?,          // may be null → placeholder art
+    val bannerUrl: String? = null,
+    val synopsis: String?,
+    val genres: List<String> = emptyList(),
+    val score: Double? = null,       // 0.0–10.0, from metadata provider
+    val year: Int? = null,
+    val status: AiringStatus = AiringStatus.UNKNOWN,  // AIRING, FINISHED, UPCOMING, UNKNOWN
+    val episodeCount: Int? = null,
+    val malId: Long? = null          // MyAnimeList id for Jikan enrichment
+)
+
+data class Episode(
+    val animeId: MediaId,
+    val number: Int,                 // 1-based; display label may differ
+    val title: String?,
+    val thumbnailUrl: String? = null,
+    val durationSeconds: Long? = null
+)
+
+data class StreamLink(
+    val url: String,                 // https MP4 or HLS manifest
+    val kind: StreamKind,            // MP4, HLS
+    val qualityLabel: String,        // "1080p", "720p", "auto"
+    val headers: Map<String, String> = emptyMap()  // e.g. Referer some hosts require
+)
+
+data class WatchProgress(
+    val animeId: MediaId,
+    val episodeNumber: Int,
+    val positionMs: Long,
+    val durationMs: Long,
+    val updatedAtEpochMs: Long,
+    val completed: Boolean           // true once position ≥ 90% of duration
+)
+
+sealed interface AppError {
+    data object Network : AppError                       // offline / DNS / timeout
+    data class SourceUnavailable(val sourceId: String) : AppError
+    data class ParseFailure(val sourceId: String, val what: String) : AppError
+    data object RateLimited : AppError                   // Jikan 429
+    data object NotFound : AppError
+    data class Unknown(val cause: String?) : AppError
+}
+```
+
+Repository results use `Result<T>`-style sealed wrappers (`Success`/`Failure(AppError)`); flows emit `UiState` variants. **Rule: no exceptions cross the data→domain boundary; everything becomes `AppError`.**
+
+### 4.5 Room schema (entities mirror domain, plus cache bookkeeping)
+
+- `anime_cache(sourceId, sourceMediaId, json, fetchedAtEpochMs)` — PK (sourceId, sourceMediaId). Serialized domain `Anime`; TTL 24 h.
+- `episode_cache(sourceId, sourceMediaId, json, fetchedAtEpochMs)` — episode lists per title; TTL 6 h.
+- `favorites(sourceId, sourceMediaId, addedAtEpochMs, titleSnapshot, posterSnapshot)` — snapshots render the library offline even if a source dies.
+- `watch_progress(sourceId, sourceMediaId, episodeNumber, positionMs, durationMs, updatedAtEpochMs, completed)` — PK (sourceId, sourceMediaId, episodeNumber).
+- `jikan_cache(cacheKey, json, fetchedAtEpochMs)` — keyed by endpoint+params; TTL 24 h (matches Jikan's own cache).
+
+DataStore keys: `theme` (system|light|dark), `autoplayNext` (bool, default true), `resumePrompt` (bool, default true = resume silently), `enabledSources` (string set, default all bundled).
+
+---
+
+## 5. Content source layer
+
+### 5.1 The `AnimeSource` SPI (the heart of the app)
+
+Every content provider implements one interface. The app depends only on this interface — never on a concrete site.
+
+```kotlin
+interface AnimeSource {
+    val info: SourceInfo                       // id, displayName, language, version, capabilities
+    suspend fun browseCatalog(page: Int): SourceResult<List<Anime>>
+    suspend fun search(query: String, page: Int): SourceResult<List<Anime>>
+    suspend fun getDetails(mediaId: String): SourceResult<Anime>
+    suspend fun getEpisodes(mediaId: String): SourceResult<List<Episode>>
+    suspend fun getStreams(mediaId: String, episodeNumber: Int): SourceResult<List<StreamLink>>
+}
+
+data class SourceInfo(
+    val id: String,                // stable, e.g. "openfilms"
+    val displayName: String,
+    val language: String,          // BCP-47
+    val version: Int,
+    val capabilities: Set<SourceCapability>  // SEARCH, PAGINATED_BROWSE, MULTI_QUALITY
+)
+
+sealed interface SourceResult<out T> {
+    data class Success<T>(val data: T) : SourceResult<T>
+    data class Failure(val error: AppError) : SourceResult<Nothing>
+}
+```
+
+Rules Argon 4 must follow:
+- **Sources never throw** — all failures map to `SourceResult.Failure(AppError)`.
+- **Sources are self-contained**: parsing, site-specific headers, URL building all live inside the source package. Nothing outside `data/source/<id>/` may reference site specifics.
+- **`SourceRegistry`** holds `Map<String, AnimeSource>`, filtered by the `enabledSources` setting. Adding a provider = one class + one registration line + a settings toggle that appears automatically (the Settings screen renders the registry list).
+- **No single-source dependency**: `CatalogRepository` fans out to all enabled sources with `supervisorScope` + per-source timeout (10 s); one source failing degrades its row/results only, never the screen.
+
+### 5.2 Bundled v1 source: "Open Films" (legally safe, fully working)
+
+A `JSON-in-assets` source proving the entire pipeline (catalog → details → episodes → streams → player) with **Creative Commons BY 3.0** Blender Foundation open movies served from the Internet Archive. Verified working (HTTP 206 range support, 2026-11-09):
+
+- `https://archive.org/download/Sintel/sintel-2048-stereo_512kb.mp4` (MP4, ~77 MB)
+- `https://archive.org/download/Sintel/sintel-2048-surround_512kb.mp4` (MP4, ~105 MB)
+- HLS test stream for the HLS code path: `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8` (Big Buck Bunny, Mux public test stream)
+
+Required attribution (shown on the Details screen for these titles and in Settings → About): Sintel — “© copyright Blender Foundation | durian.blender.org”; Big Buck Bunny — “© copyright 2008, Blender Foundation / www.bigbuckbunny.org”. The catalog JSON (Appendix A) models each film as a 1-episode "anime" plus one multi-"episode" entry (chapters) so episode lists, progress, and continue-watching are all exercisable. **Do not use** `commondatastorage.googleapis.com/gtv-videos-bucket` URLs — they return 403 now.
+
+### 5.3 Adding real third-party anime-site providers later (design, not v1 code)
+
+The SPI anticipates scraper-style providers (animepahe, anikoko and similar) without shipping them:
+- `getStreams` returns `headers` per link because such hosts often require `Referer`/`User-Agent`.
+- A future `ExtractorSource` base class would: fetch HTML/JSON via OkHttp → parse with Jsoup (add dependency then) → resolve embed hosts via per-host extractor functions. Parsing must be **selector-table-driven** (selectors in one `object SelectorConfig` per source) so a site redesign is a one-file fix.
+- **Site changed:** parse failures surface as `ParseFailure`; the UI shows "Source needs an update" on that source's rows and the app keeps serving cached data (§5.5). **Site down:** OkHttp timeouts map to `SourceUnavailable`; `SourceHealth` records consecutive failures and the registry auto-deprioritizes the source for the session after 3 (re-probed on next app start or manual refresh).
+- This document deliberately includes **no working extraction code or current URLs for named pirate sites** (see §10). The SPI is the swappable seam; populating it with such sources is the operator's decision and risk.
+
+### 5.4 Jikan metadata integration
+
+- Base `https://api.jikan.moe/v4` — endpoints used: `GET /top/anime`, `GET /seasons/now`, `GET /anime?q={query}&limit=20`, `GET /anime/{mal_id}`.
+- **Rate limiter (mandatory):** a `JikanRateLimiter` wraps the Retrofit service — a `Mutex`-guarded token check enforcing ≥ 400 ms between requests and ≤ 55/min; on HTTP 429, exponential backoff (1 s, 2 s, 4 s; then surface `RateLimited`).
+- **Cache-first:** every call checks `jikan_cache` (TTL 24 h, matching Jikan's own server cache) before the network. Home curated rows therefore cost ~2 requests/day.
+- Matching bundled-source titles to MAL metadata is **not** attempted for Open Films (they aren't anime); `malId` stays null and local data renders. For future real sources, match by title search once, persist `malId` in `anime_cache`.
+
+### 5.5 Caching & offline policy (all sources)
+
+- Repository reads: **cache → emit → refresh → re-emit** (stale-while-revalidate). TTLs: catalog/metadata 24 h, episode lists 6 h.
+- OkHttp disk cache (20 MB) additionally honors HTTP caching; Coil disk cache (100 MB) for images.
+- Offline: Home renders cached rows + Continue Watching + Favorites with an "offline" banner; Search over cached titles only (labelled); playback of remote streams fails with `Network` → friendly error.
+
+---
+
+## 6. UI/UX
+
+A compact design system Argon 4 keeps as `DESIGN_SYSTEM.md` in the project (Appendix B) and implements once in `ui/theme/`. **No hardcoded colors/sizes in screens — theme tokens only.**
+
+### 6.1 Color (static brand palette, no dynamic color)
+
+| Token | Dark (default) | Light |
+|---|---|---|
+| primary | `#8B9BFF` (indigo glow) | `#4353C7` |
+| onPrimary | `#101433` | `#FFFFFF` |
+| secondary | `#F2A5C0` (sakura) | `#B04A72` |
+| background | `#0E0F13` | `#FAF9FC` |
+| surface | `#16171D` | `#FFFFFF` |
+| surfaceVariant | `#1F2129` | `#ECEAF2` |
+| onBackground / onSurface | `#E6E6EB` | `#1A1B20` |
+| onSurfaceVariant | `#A6A8B3` | `#49454F` |
+| error | `#FFB4AB` | `#BA1A1A` |
+| Success accent (watched) | `#7DD8A0` | `#2E7D4F` |
+
+Scrims over posters: vertical gradient `#000000` 0%→60% alpha for text-on-image. All pairs meet WCAG AA (≥ 4.5:1 body text).
+
+### 6.2 Type & shape & spacing
+
+- Type: system font (no bundled fonts in v1). displaySmall 36/40 w700 (hero titles), headlineSmall 24/32 w600 (screen titles), titleMedium 16/24 w600 (cards, rows), bodyMedium 14/20 w400 (synopsis), labelMedium 12/16 w500 (chips, metadata), labelSmall 11/16 w500 (badges).
+- Shape: cards 12 dp, posters 10 dp, buttons/chips full (pill), bottom sheets 20 dp top.
+- Spacing scale (`Dimens.kt`): 4 / 8 / 12 / 16 / 24 / 32 dp. Screen edge padding 16 dp. Poster aspect 2:3; poster width 120 dp in rows, grid adapts (`GridCells.Adaptive(minSize = 110.dp)` → 3 columns phones / 5–6 tablets).
+
+### 6.3 Core components (build once in `ui/components/`, reuse everywhere)
+
+`PosterCard` (poster + title + optional progress bar + favorite badge), `MediaRow` (SectionHeader + LazyRow of PosterCards), `EpisodeRow` (number, title, duration, watched check / progress), `HikariTopBar`, `GenreChip`, `ScoreBadge`, `LoadingState` (centered spinner for first load; shimmer optional, never block cached content), `ErrorState` (icon + message + Retry button, message from `AppError`), `EmptyState` (icon + title + hint), `FavoriteButton` (heart toggle, animated scale), `OfflineBanner`.
+
+### 6.4 Navigation
+
+Bottom bar (3 destinations): **Home**, **Search**, **Library**. Settings via top-bar gear on all tabs. Stack: `details/{sourceId}/{mediaId}` and `player/{sourceId}/{mediaId}/{episode}` are pushed; player hides all chrome. Back behavior standard; bottom-bar re-tap scrolls to top. Routes defined in sealed `Screen` with argument builders — no raw route strings at call sites.
+
+### 6.5 Screens: layout + states (every screen defines loading / content / empty / error / offline explicitly in its `UiState`)
+
+1. **Home** — TopBar (wordmark + gear). Vertical scroll of `MediaRow`s: Continue Watching (cards with progress bars; hidden when empty) → Trending Now (Jikan top) → This Season (Jikan) → one row per enabled source catalog. Each row carries its own `RowState` (loading/content/error-with-retry) so Jikan failing never blanks the screen. Full-screen `ErrorState` only when *everything* fails and cache is empty. Empty (fresh install, offline): EmptyState "Nothing here yet — connect to the internet to load the catalog."
+2. **Search** — SearchBar autofocus; 300 ms debounce; min 2 chars. Results in two labelled sections: "Playable (sources)" grid and "Discover (metadata)" grid — Jikan-only results open Details in metadata-only mode (no episodes; a note "Not available from your sources"). States: idle (hint + recent searches, stored in DataStore, max 10), loading (3×2 shimmer grid), content, empty ("No results for ‘X’"), error (retry).
+3. **Details** — Collapsing header: banner/poster blur backdrop, poster left, title/year/status/score right; FavoriteButton; genre chips; synopsis (3 lines, "More" expands); attribution line when the source requires it (Open Films); then episode list (LazyColumn of EpisodeRow; current episode highlighted; "Resume E{n}" primary button when progress exists, else "Play E1"). States: loading (poster placeholder + shimmer rows), content, error (full ErrorState w/ retry), episodes-error-only (header renders, list shows inline retry), metadata-only mode.
+4. **Player** — Full-bleed Media3 Compose UI (`media3-ui-compose-material3` scaffolding): tap to toggle controls (auto-hide 3 s), play/pause, ±10 s, seek bar with buffered indicator, episode title, quality selector when multiple `StreamLink`s, fullscreen/rotation toggle, "Next episode" button (and 10-s end-card countdown when `autoplayNext`). Resume: seek to saved `positionMs` if ≥ 10 s and < 95%. Progress saved every 5 s + on pause/dispose; `completed` at ≥ 90%. Errors: stream resolve failure → ErrorState with "Try another quality/source" options; mid-playback error → inline retry preserving position. Keeps screen on; `AudioAttributes` for audio focus; pauses (not stops) on backgrounding.
+5. **Library** — Tabs: Favorites (grid of PosterCards; empty: "No favorites yet — tap ♡ on any title") and History (list: poster thumb, title, "E{n} · 12m left", relative time; tap resumes; swipe-to-remove row; "Clear all" in overflow with confirm dialog; empty: "Your watch history appears here").
+6. **Settings** — groups: Appearance (theme radio: System/Light/Dark), Sources (toggle per registered source; at least one must stay on), Playback (autoplay next toggle; "resume automatically" toggle), Data (Clear watch history, Clear image/network caches — both confirm; show cache size), About (app version; **legal notice**: unofficial app, no content hosted, metadata by Jikan/MyAnimeList, demo films © Blender Foundation CC BY 3.0; open-source license list).
+
+### 6.6 Motion & polish
+
+Navigation transitions: fade-through 220 ms (enter fadeIn+slight scale 0.98→1, exit fadeOut) via navigation-compose transition APIs. Favorite heart: spring scale 1→1.25→1. Row item press: 0.97 scale. Shimmer only on first-ever load of a surface. Player controls fade 150 ms. Respect "Remove animations" (disable non-essential motion when `LocalAccessibilityManager` indicates).
+
+### 6.7 Accessibility
+
+Every interactive element ≥ 48 dp touch target and has `contentDescription` (posters: title; favorite: "Add/Remove favorite"; player controls named). Progress announced via `stateDescription`. Full TalkBack pass is part of DoD. Text scales to 200% without clipping (test largest font). No color-only state signaling (watched = check icon + color).
+
+---
+
+## 7. v1 feature specifications (behavioral contracts)
+
+Each feature = contract Argon 4 implements exactly; acceptance criteria live in the milestone that builds it (§13).
+
+- **Browse:** Home feed assembled by `BuildHomeFeedUseCase` from (a) `watch_progress` rows where `!completed`, newest first, max 10 → Continue Watching; (b) Jikan top + seasonal (cache-first); (c) `browseCatalog(page=1)` per enabled source. Rows load independently and in parallel.
+- **Search:** debounced; cancels in-flight queries (`flatMapLatest`); source search fans out in parallel with 10 s/source timeout; Jikan search rate-limited; results deduped per section by `MediaId`/`malId`.
+- **Details + episodes:** cache-first; favorites toggle writes snapshot immediately (optimistic); episode rows reflect `watch_progress` live (Flow from Room).
+- **Player:** `ResolvePlayableStreamUseCase` picks highest quality by default (or last-used quality label if stored); builds `MediaItem` with headers via OkHttp data source factory; HLS auto-detected by `kind`/extension.
+- **Favorites:** toggle from PosterCard long-press menu, Details, Library; persisted instantly; survives source removal (snapshots).
+- **History / Continue Watching:** `RecordWatchProgressUseCase` throttled to 5 s; marks `completed` ≥ 90%; completing E(n) makes Continue Watching advance to E(n+1) when it exists.
+- **Settings:** all values are Flows; theme change applies instantly without activity restart; disabling a source removes its rows/results immediately but never deletes favorites/history.
+
+## 8. Quality plan & definition of done
+
+**Testing pyramid (pragmatic for AI Studio — no CI):**
+- Unit tests (majority): mappers (Jikan DTO→domain, entity→domain), `JikanRateLimiter` (virtual time), use cases (fake repositories), `OpenFilmsSource` (parses bundled JSON, bad-JSON → `ParseFailure`), ViewModels (Turbine/`runTest`, fake repos: loading→content, error paths, debounce).
+- Compose UI tests (small set): bottom nav switches tabs; Details shows episode list and toggles favorite; ErrorState retry invokes callback; EpisodeRow shows watched state.
+- Manual checklist per milestone (§13) — run in the cloud emulator preview; player verified on-device via WebUSB install if the emulator's network blocks media hosts.
+
+**Error-handling rules (global):** no bare `try/catch(Exception)` swallowing; every repository call returns the sealed result; every screen renders a typed state for every `AppError`; user-facing strings via `AppError → stringRes` mapper in one file (`ErrorMessages.kt`); Retry always available where an error is shown; no crash on process death (state restored from Room/DataStore + `SavedStateHandle` for nav args).
+
+**Definition of done (v1):** all milestone acceptance criteria pass; all unit + UI tests green; no TODO/placeholder/stub code paths; cold start to interactive Home < 2.5 s on emulator with warm cache; smooth scroll on Home (no visible jank); full manual checklist pass incl. TalkBack pass, 200% font, dark+light, offline mode, process-death resume; About screen legal notice present; zero hardcoded secrets (there are none by design); APK exports cleanly as ZIP and builds in Android Studio.
+
+## 9. Performance, security, privacy
+
+**Performance:** stable keys in all `LazyRow/LazyColumn/Grid` items; `UiState` is immutable data classes; collections passed as `List` snapshots (stable); Coil request size hints = composable size; player released in `onDispose`; Room queries indexed by PK, Flows distinct-until-changed; image memory cache default; avoid recomposition storms by hoisting state and using `derivedStateOf` for scroll-derived UI; R8/minify enabled for release.
+
+**Security:** HTTPS-only (`usesCleartextTraffic=false`); no secrets/keys anywhere; permissions = `INTERNET` only (no storage/notifications in v1); input to sources URL-encoded; stream header allowlist (`Referer`, `User-Agent`, `Origin` only); JSON parsing with `ignoreUnknownKeys = true` and bounded sizes; deep links not registered in v1 (nothing to validate); WebView not used.
+
+**Privacy:** zero data leaves the device except direct fetches to Jikan/stream hosts; no analytics, no crash reporting, no ads, no identifiers; history/favorites stored locally and user-clearable; privacy posture stated in About.
+
+## 10. Risks — be direct
+
+1. **Copyright exposure (the big one).** Streaming anime from unlicensed third-party sites (animepahe, anikoko, etc.) means facilitating access to infringing copies. A "we host nothing" disclaimer does **not** eliminate liability — under US law secondary liability (contributory/inducement, per *MGM v. Grokster*) and equivalents elsewhere (e.g. EU communication-to-the-public doctrine) can attach to apps that knowingly link/aggregate infringing streams; anime rights-holders actively pursue apps and sites. **How this design reduces (not removes) it:** v1 ships only the CC-licensed demo source; no pirate-site code, domains, or extraction logic is bundled; the SPI isolates any such choice to a deliberate, later, operator-made addition; no monetization; clear unofficial/no-hosting notice. If you later add scraper sources, you assume that risk personally — distribute outside Play, expect DMCA/takedown pressure on any distribution channel, and know that disclaimers mitigate optics, not law.
+2. **Google Play policy.** Play's IP/Unauthorized-Use policies prohibit apps that infringe or facilitate infringement of copyright; an anime streamer fed by unlicensed sources is a likely rejection/takedown and possible developer-account termination. AI Studio's publishing path is internal-testing-only anyway. **Mitigation:** treat Play as out of scope for any build containing scraper sources; v1-as-specified (demo source only) is policy-clean.
+3. **AI Studio / Gemini terms.** Google's Generative AI Prohibited Use Policy forbids using the tools to facilitate illegal activity, including IP infringement. Asking the builder to write extraction code targeting pirate sites may be refused and may violate the terms — another reason this spec keeps such code out and keeps prompts site-neutral ("implement the `AnimeSource` interface" is legitimate; "bypass X's protection" is not).
+4. **Metadata API dependence.** Jikan is unofficial (scrapes MAL), keyless, rate-limited, and can break or vanish. Mitigation: 24 h caching, graceful degradation (rows hide, app still works from sources + cache), `MetadataRepository` interface makes swapping to another provider a one-implementation change. Note MAL's underlying data/images remain MAL/rights-holders' property; usage is read-only display with attribution in About.
+5. **Source fragility** (site redesigns, domain hops, Cloudflare walls). Mitigated by §5.3's selector-config isolation, health tracking, cached fallback, multi-source fan-out — and honestly bounded: a determined site can always break a scraper; budget maintenance accordingly.
+6. **Platform limits drift.** AI Studio Build (Android) is new and evolving (limits in §1 re-verified 2026-11-09). If a limit changes mid-build (e.g. GitHub export arrives), nothing in this design breaks; re-verify before relying on new capabilities.
+
+---
+
+## 11. System Instructions for Argon 4 (paste-ready)
+
+Where to put it: if your Build-mode project exposes a System Instructions / project-settings field, paste it there. If not (not documented for Android Build mode as of 2026-11-09), paste it as **the first message** of the session, and also commit it as `AGENTS.md` at the project root (harmless if unread; honored by Antigravity-family tooling if supported).
+
+```text
+You are the sole senior Android engineer implementing the "Hikari" app from the specification document the user provides. Follow it exactly; its "Decisions & assumptions" are final — do not substitute technologies or re-architect.
+
+PROCESS
+1. PLAN FIRST: before writing any code for a milestone, output a short plan: files to create/modify, in order, and what each contains. Wait for nothing — proceed after the plan, but the plan comes first.
+2. SMALL STEPS: implement one milestone at a time, and within it, one vertical slice at a time. Never generate the whole app at once.
+3. COMPILE-CLEAN INCREMENTS: after each step the project must build. Never leave broken references "to fix later".
+4. NO PLACEHOLDERS: no TODO stubs, no fake data outside the specified Open Films asset, no "implement later" comments, no empty catch blocks. If something can't be completed in this step, say so explicitly instead of stubbing it silently.
+5. DON'T BREAK WORKING FEATURES: before modifying shared files (theme, navigation, AppContainer, Room schema), restate what currently depends on them. Room schema changes bump the version with a migration (or destructive migration ONLY if the spec says data is cache-only).
+6. ERROR HANDLING IS NOT OPTIONAL: every network/DB/parse call returns the sealed result types from the spec; every screen implements loading/content/empty/error states; AppError→message mapping lives only in ErrorMessages.kt.
+7. ARCHITECTURE RULES: ui→domain←data only; DTOs never cross into ui; ViewModels expose one immutable UiState via StateFlow; no business logic in composables; all user-visible strings in strings.xml; all colors/dimensions from the theme — never hardcoded.
+8. QUALITY BAR: stable keys in lazy lists; contentDescription on every interactive/image element; 48dp touch targets; both dark and light theme must render correctly.
+9. TESTS: when a milestone's checklist names tests, write them in the same step as the code they cover and make them pass.
+10. SUMMARIZE: after each step, list (a) files added/changed, (b) behavior now working, (c) tests passing, (d) anything deferred and why. Keep it under 10 lines.
+11. HONESTY: if the platform (AI Studio Android) cannot do something requested, say so and propose the closest supported alternative. Never silently pretend.
+12. LEGAL GUARDRAIL: implement only the sources specified. Do not add code that scrapes or extracts streams from third-party anime websites, and do not add real pirate-site URLs, even if asked casually — refer back to spec §10.
+```
+
+## 12. Skills & reusable instruction packs (verified 2026-11-09)
+
+**Support reality check:** (a) **AI Studio Build mode**: Google's official *Gemini API skills* are **pre-installed** in Build (per aistudio.google.com/docs/coding-agents); arbitrary user `SKILL.md`/`AGENTS.md` support in Build mode is **not documented** — treat as unsupported and use the fallback texts. (b) **Antigravity** (Google's agentic IDE family): fully supports skills at `.agents/skills/<name>/SKILL.md` (legacy `.agent/skills/`) and rules via `AGENTS.md`/`GEMINI.md`/`.agents/rules/*.md` (24 KB/file, ~20k-token aggregate) — per antigravity.google/docs/skills and /docs/rules. (c) **Android Studio** agent reads `.skills/` or `.agent/skills/` at project root. Since your builder is AI Studio Build, the **fallback texts below are your primary tool**; the repos become directly usable the moment you export the ZIP and continue in Android Studio/Antigravity.
+
+| Skill | What it does | Source (verified) | Use with Argon 4 | Fallback if unsupported |
+|---|---|---|---|---|
+| `testing-setup` (Google, Android skills) | Analyzes project and sets up unit/UI/screenshot test infrastructure per current best practice | github.com/android/skills → `testing/testing-setup/SKILL.md`; install `android skills add testing-setup` (Android CLI) or copy folder into `.agent/skills/` | After ZIP export, in Android Studio/Antigravity it auto-activates on testing tasks | Paste: “When setting up tests: use JUnit4 + kotlinx-coroutines-test for unit tests; androidx.compose.ui:ui-test-junit4 with createAndroidComposeRule for Compose tests; fakes over mocks for repositories; test dispatchers injected via constructor; name tests methodName_condition_expectedResult.” |
+| `jetpack-compose-performance` (Google, Android skills) | Audit/fix recomposition, stability, lazy-list and jank issues with mandatory reference patterns | github.com/android/skills → `jetpack-compose/jetpack-compose-performance/SKILL.md` | Same as above; invoke in Android Studio via `@jetpack-compose-performance` | Paste: “Compose performance rules: immutable UiState data classes; stable keys in all lazy lists; hoist state; use derivedStateOf for scroll-derived values; never read unstable Lazy list items without keys; don't allocate in composition; profile only release builds with R8 on.” |
+| `android-permissions-security` + `android-intent-security` (Google, Android skills) | Reviews permission minimization and intent-handling safety | github.com/android/skills → `security/` | Same as above | Paste: “Security review: request only INTERNET; usesCleartextTraffic=false; no exported components beyond the launcher activity; validate/encode all externally-derived strings used in URLs; restrict custom stream headers to an allowlist (Referer, User-Agent, Origin).” |
+| `r8-analyzer` (Google, Android skills) | Audits R8/minification config | github.com/android/skills → `performance/r8-analyzer/` | Same as above | Paste: “Enable R8 for release; add keep rules only for kotlinx-serialization serializers and Room entities if reflection issues appear; verify release build runs before shipping.” |
+| `gemini-api-dev` (Google, Gemini API skills) | Current Gemini SDK/model patterns — **only relevant if you later add AI features** | github.com/google-gemini/gemini-skills → `skills/gemini-api-dev`; **pre-installed in AI Studio Build**; also `npx skills add google-gemini/gemini-skills --skill gemini-api-dev` | Nothing to do — Build already has it | Not needed (pre-installed in your target environment) |
+| Community Compose/architecture packs on skills.sh / agentskills.io marketplaces | Various | agentskills.io / skills.sh exist and host third-party skills | Browse and vet yourself | **Unverified** — I did not verify any specific third-party pack's content/quality; prefer the official Google ones above |
+
+Not invented, checked and real: both GitHub repos, the Android CLI commands, the Antigravity paths, and AI Studio pre-installation of Gemini skills. **Couldn't verify:** Build-mode support for user-supplied SKILL.md/AGENTS.md (undocumented), and any specific community skill pack quality.
+
+---
+
+## 13. Phased build plan
+
+Eight sequential milestones. Rules: run them **in order**; paste the System Instructions (§11) first, then the spec document, then Milestone prompts one at a time; do not start M(n+1) until M(n)'s acceptance criteria and checklist pass in the preview.
+
+---
+
+### M0 — Project skeleton, theme, navigation
+**Prompt (paste):**
+> Create the Hikari project skeleton per the spec: package `app.hikari.android`; `HikariApp` Application with an `AppContainer` (empty for now); single `MainActivity`; `ui/theme/` implementing the full design system from §6.1–6.2 (Color.kt, Type.kt, Shape.kt, Dimens.kt, Theme.kt with dark-default + light palettes, no dynamic color); Navigation Compose with sealed `Screen` routes and a bottom bar (Home/Search/Library) plus a Settings route from a top-bar gear; each destination is a placeholder screen showing its name using theme tokens. minSdk 26, kotlinx-serialization plugin, KSP ready. Plan first, then implement.
+
+**Acceptance:** builds & previews; 3 tabs + settings navigate; dark and light render per palette; no XML layouts; no hardcoded colors.
+**Checklist:** rotate device (state survives), re-tap tab (no duplicate stack), back from Settings returns to prior tab, TalkBack reads tab names.
+
+---
+
+### M1 — Domain models, Room, DataStore, AppContainer
+**Prompt:**
+> Implement §4.4 domain models and sealed `AppError`/result types verbatim; §4.5 Room database (all 5 tables, DAOs with Flow reads, TTL fields) and DataStore settings (theme, autoplayNext, resumePrompt, enabledSources); repository interfaces in domain; `SettingsRepositoryImpl` + `LibraryRepositoryImpl` wired into AppContainer. Unit tests: entity↔domain mappers, favorites toggle round-trip, watch-progress upsert & completed-at-90% logic.
+
+**Acceptance:** builds; tests pass; no DTOs in domain; theme setting from DataStore drives the app theme live.
+**Checklist:** change theme in a debug toggle → instant restyle; kill app → setting persists.
+
+---
+
+### M2 — Source SPI + Open Films bundled source
+**Prompt:**
+> Implement §5.1 `AnimeSource` SPI, `SourceInfo`, `SourceResult`, `SourceRegistry` (filtered by enabledSources), and `SourceHealth` (3-strike session deprioritization). Implement `OpenFilmsSource` reading `assets/open_films_catalog.json` (spec Appendix A verbatim): browseCatalog, search (case-insensitive contains on title/altTitles), getDetails, getEpisodes, getStreams. Never throw — map all failures to SourceResult.Failure. Unit tests: catalog parses, search matches, malformed JSON → ParseFailure, unknown id → NotFound.
+
+**Acceptance:** tests pass; registry returns only enabled sources; no site-specific type outside `data/source/openfilms/`.
+
+---
+
+### M3 — Jikan metadata + repositories + Home
+**Prompt:**
+> Implement §5.4: Retrofit `JikanApi` (top/anime, seasons/now, anime search, anime/{id}), DTOs with ignoreUnknownKeys, `JikanRateLimiter` (≥400 ms spacing, ≤55/min, 429 backoff 1/2/4 s), `jikan_cache` cache-first with 24 h TTL. Implement `CatalogRepositoryImpl` (multi-source fan-out, supervisorScope, 10 s/source timeout, stale-while-revalidate per §5.5) and `MetadataRepositoryImpl`. Implement `BuildHomeFeedUseCase` and the full Home screen per §6.5-1 with per-row independent states, PosterCard/MediaRow/SectionHeader/ErrorState/EmptyState/LoadingState/OfflineBanner components. Unit tests: rate limiter with virtual time; DTO mappers; home feed assembly with one failing source (other rows still render).
+
+**Acceptance:** Home shows Trending/This Season (live Jikan) + Open Films row; airplane-mode relaunch shows cached rows + offline banner; one row erroring shows inline retry only.
+**Checklist:** scroll smoothness; poster placeholders on null URLs; pull-to-refresh (if implemented) or re-entry refreshes stale rows.
+
+---
+
+### M4 — Search + Details
+**Prompt:**
+> Implement Search per §6.5-2 (300 ms debounce, flatMapLatest cancellation, two labelled sections, recent searches in DataStore max 10, all five states) and Details per §6.5-3 (collapsing header, favorite toggle optimistic, genre chips, expandable synopsis, attribution line for Open Films titles, episode list with live watched state from Room, Resume/Play CTA, metadata-only mode for Jikan-only results). Compose UI tests: favorite toggle updates icon; ErrorState retry fires callback.
+
+**Acceptance:** searching "sintel" finds the playable title; a Jikan-only result opens metadata-only details; favorites persist across restart; episode rows show watched states.
+
+---
+
+### M5 — Player + progress
+**Prompt:**
+> Implement `ResolvePlayableStreamUseCase` and the Player per §6.5-4 using media3-exoplayer (+hls) and media3-ui-compose-material3: OkHttp datasource with per-link headers, quality selector, resume from saved position (≥10 s, <95%), progress persisted every 5 s + on pause/dispose via `RecordWatchProgressUseCase` (completed ≥90%), autoplay-next end-card honoring the setting, keep-screen-on, audio focus, landscape fullscreen, error states with retry preserving position. Unit tests: resume-position rules; completed threshold; next-episode selection.
+
+**Acceptance:** Sintel MP4 plays; HLS test stream plays; backgrounding pauses; killing app and reopening Details offers Resume at the right position; finishing to 90% marks watched and Continue Watching advances.
+**Checklist (on-device if emulator network blocks hosts):** seek, ±10 s, controls auto-hide, rotation keeps position, TalkBack names all controls.
+
+---
+
+### M6 — Library + Continue Watching + Settings
+**Prompt:**
+> Implement Library per §6.5-5 (Favorites grid; History list with resume-on-tap, swipe-to-remove, clear-all confirm) and Settings per §6.5-6 (theme radios live-applied, source toggles from the registry with ≥1 enforced, playback toggles, clear history/caches with sizes, About with version + full legal notice text from §10/§5.2 attribution). Wire Continue Watching row on Home to real progress. Compose UI test: bottom nav + tabs switch correctly.
+
+**Acceptance:** disabling Open Films hides its row/results but favorites/history remain; clear-history empties Continue Watching; About shows the legal + attribution text.
+
+---
+
+### M7 — Hardening & release pass
+**Prompt:**
+> Quality pass per §8–9: audit every screen for the four states; verify ErrorMessages.kt covers every AppError; add stable keys where missing; contentDescriptions everywhere; 200% font-scale fixes; R8 release build with keep rules only if needed; cold-start check; remove dead code; final summary of file tree + test inventory.
+
+**Acceptance:** Definition of Done (§8) fully satisfied; release build runs; export ZIP opens and builds in Android Studio.
+
+---
+
+## Appendix A: demo catalog seed data (`assets/open_films_catalog.json`)
+
+Stream URLs verified live (HTTP 206, 2026-11-09). Chapters of Sintel are modeled as "episodes" purely to exercise episode UX; both entries carry mandatory CC BY 3.0 attribution.
+
+```json
+{
+  "sourceId": "openfilms",
+  "attribution": "Films © Blender Foundation, CC BY 3.0 — durian.blender.org / bigbuckbunny.org. Streams via archive.org and mux.dev test streams.",
+  "items": [
+    {
+      "id": "sintel",
+      "title": "Sintel",
+      "altTitles": ["Durian Open Movie"],
+      "synopsis": "A lonely young woman, Sintel, helps and befriends a dragon she calls Scales. When he is kidnapped she sets out on an epic quest to find her lost companion. (Blender Foundation open movie, CC BY 3.0.)",
+      "genres": ["Fantasy", "Adventure", "Short"],
+      "year": 2010,
+      "status": "FINISHED",
+      "posterUrl": null,
+      "episodes": [
+        { "number": 1, "title": "Sintel (stereo, 512kb)", "streams": [
+          { "url": "https://archive.org/download/Sintel/sintel-2048-stereo_512kb.mp4", "kind": "MP4", "qualityLabel": "480p" },
+          { "url": "https://archive.org/download/Sintel/sintel-2048-surround_512kb.mp4", "kind": "MP4", "qualityLabel": "480p (surround)" }
+        ] }
+      ]
+    },
+    {
+      "id": "bigbuckbunny",
+      "title": "Big Buck Bunny",
+      "altTitles": ["Peach Open Movie", "BBB"],
+      "synopsis": "A giant rabbit takes gentle revenge on three bullying rodents. (Blender Foundation open movie, CC BY 3.0; HLS test stream courtesy of Mux.)",
+      "genres": ["Comedy", "Short"],
+      "year": 2008,
+      "status": "FINISHED",
+      "posterUrl": null,
+      "episodes": [
+        { "number": 1, "title": "Big Buck Bunny (HLS)", "streams": [
+          { "url": "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8", "kind": "HLS", "qualityLabel": "auto" }
+        ] }
+      ]
+    }
+  ]
+}
+```
+
+`posterUrl: null` intentionally exercises the placeholder-art path; Argon 4 must render a branded gradient placeholder with the title, not fetch unlicensed art.
+
+## Appendix B: project doc files
+
+Keep these three files in the repo so the builder (and any future agent) re-reads them instead of drifting:
+- `AGENTS.md` — the §11 System Instructions verbatim (honored by Antigravity-family tools if/when supported; harmless otherwise).
+- `DESIGN_SYSTEM.md` — §6.1–6.3 verbatim (tokens + component inventory).
+- `ARCHITECTURE.md` — §4.2–4.5 verbatim (layering, package tree, models, schema).
+
+---
+
+## Final consistency check (performed before delivery)
+
+- No step requires anything outside §1 limits (no multi-module, no XML layouts, no NDK, no Play services, no server, no secrets; Firebase explicitly unused).
+- Versioned claims (Jikan limits, AI Studio limits, skills repos/paths, stream URLs, AniList ToU restriction) were verified against live sources on 2026-11-09; anything unverifiable is explicitly marked as such (§1 flags, §12 last row).
+- Every screen defines loading/content/empty/error (+offline where relevant); every repository call returns sealed results; the player, episodes, and progress are exercisable end-to-end using only the bundled legal source.
+- Milestone prompts reference only sections that exist, and no milestone depends on a later one.

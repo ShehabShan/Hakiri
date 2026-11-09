@@ -1,0 +1,6 @@
+{
+  "name": "Hikari",
+  "description": "A private, source-swappable Android anime discovery, library tracking, and streaming companion.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
